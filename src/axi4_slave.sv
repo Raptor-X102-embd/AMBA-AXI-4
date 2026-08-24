@@ -2,9 +2,10 @@
 `include "axi4_pkg.svh"
 `include "addr_next_macro.svh"
 
+
 `timescale 10ns/1ns
 module axi4_slave
-        import axi4_pkg::*;
+    import axi4_pkg::*;
 #(
     parameter MEM_SIZE = 1024,
     parameter ADDR_WIDTH = 32,

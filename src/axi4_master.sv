@@ -45,6 +45,7 @@ module axi4_master
         logic [ADDR_WIDTH-1:0] addr;
         logic [7:0]            len;
         logic [7:0]            size_bytes;
+        logic [2:0]            size_code;          // FIX: храним исходный код размера
         logic [1:0]            burst;
         logic [7:0]            cnt;
         logic                  active;
@@ -55,23 +56,22 @@ module axi4_master
     logic [QIDX_BITS-1:0] read_q_head, read_q_tail;
     logic [QIDX_BITS:0]   read_q_count;
     logic push_read, pop_read;
-
-    pending_t write_req_q [0:MAX_OUTSTANDING-1];
-    pending_t write_pending [0:MAX_OUTSTANDING-1];
-    logic [QIDX_BITS-1:0] write_q_head, write_q_tail;
-    logic [QIDX_BITS:0]   write_q_count;
-    logic push_write, pop_write, pop_wdata;
-
-    logic [DATA_WIDTH-1:0] wdata_fifo [0:MAX_OUTSTANDING-1];
-    logic [QIDX_BITS-1:0]  wdata_head, wdata_tail;
-    logic [QIDX_BITS:0]    wdata_count;
-
     logic has_active_reads;
-    //logic has_active_writes;
-    int active_idx;
-
     logic can_issue_read;
-    //logic can_issue_write;
+
+    pending_t write_req_q [0:MAX_OUTSTANDING-1];   // holds all requests (waiting, active, or finished)
+    logic [DATA_WIDTH-1:0] wdata_fifo [0:MAX_OUTSTANDING-1]; // data associated with each request
+
+    logic [QIDX_BITS-1:0] write_q_tail;
+    logic [QIDX_BITS:0]   write_q_count;
+
+    logic [QIDX_BITS-1:0] aw_head; // write_q_head
+    logic [QIDX_BITS-1:0] w_ptr;         // index of transaction currently transferring data
+    logic [QIDX_BITS-1:0] b_ptr;         // index of transaction awaiting response
+    logic [QIDX_BITS:0]   active_count;  // number of outstanding writes (AW issued, B not yet received)
+
+    logic [QIDX_BITS:0]   wdata_count;   // number of slots in wdata_fifo that are occupied
+    logic push_write, pop_aw, pop_wdata, pop_b;
 
     function automatic int find_free_slot(ref pending_t arr[0:MAX_OUTSTANDING-1]);
         for (int i = 0; i < MAX_OUTSTANDING; i++)
@@ -88,7 +88,7 @@ module axi4_master
 
     function automatic int find_write_by_id(input [ID_WIDTH-1:0] id);
         for (int i = 0; i < MAX_OUTSTANDING; i++)
-            if (write_pending[i].active && write_pending[i].id == id)
+            if (write_req_q[i].active && write_req_q[i].id == id)
                 return i;
         return -1;
     endfunction
@@ -113,19 +113,6 @@ module axi4_master
             R_IDLE:  mrstate_next = (read_q_count > 0 || has_active_reads) ? R_DATA : R_IDLE;
             R_DATA:  mrstate_next = (read_q_count == 0 && !has_active_reads) ? R_IDLE : R_DATA;
             default: mrstate_next = R_IDLE;
-        endcase
-    end
-
-    typedef enum logic [1:0] { W_IDLE, W_ADDR, W_DATA, W_RESP } mwstate_t;
-    mwstate_t mwstate, mwstate_next;
-
-    always_comb begin
-        case (mwstate)
-            W_IDLE:  mwstate_next = (write_q_count > 0) ? W_ADDR : W_IDLE;
-            W_ADDR:  mwstate_next = (bus.AWVALID && bus.AWREADY) ? W_DATA : W_ADDR;
-            W_DATA:  mwstate_next = (bus.WVALID && bus.WREADY && bus.WLAST) ? W_RESP : W_DATA;
-            W_RESP:  mwstate_next = (bus.BVALID && bus.BREADY) ? W_IDLE : W_RESP;
-            default: mwstate_next = W_IDLE;
         endcase
     end
 
@@ -159,10 +146,10 @@ module axi4_master
             read_rid_out <= '0;
             bus.ARVALID <= 1'b0;
             bus.ARADDR  <= '0;
-            bus.ARLEN       <= '0;
+            bus.ARLEN   <= '0;
             bus.ARSIZE  <= '0;
             bus.ARBURST <= INCR;
-            bus.ARID        <= '0;
+            bus.ARID    <= '0;
             bus.ARLOCK  <= 1'b0;
             bus.ARCACHE <= 4'b0000;
             bus.ARPROT  <= 3'b000;
@@ -173,23 +160,22 @@ module axi4_master
             bus.RREADY <= (read_q_count > 0) || has_active_reads;
 
             if (push_read) begin
-                read_req_q[read_q_tail].id               <= read_id;
-                read_req_q[read_q_tail].addr             <= read_addr;
-                read_req_q[read_q_tail].len              <= read_len;
+                read_req_q[read_q_tail].id         <= read_id;
+                read_req_q[read_q_tail].addr       <= read_addr;
+                read_req_q[read_q_tail].len        <= read_len;
                 read_req_q[read_q_tail].size_bytes <= 1 << read_size;
-                read_req_q[read_q_tail].burst            <= read_burst;
-                //read_req_q[read_q_tail].cnt              <= '0;
-                read_req_q[read_q_tail].active       <= 1'b0;
-                read_q_tail <= (read_q_tail + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);;
+                read_req_q[read_q_tail].size_code  <= read_size;          // FIX: сохраняем код
+                read_req_q[read_q_tail].burst      <= read_burst;
+                read_req_q[read_q_tail].active     <= 1'b0;
+                read_q_tail <= (read_q_tail + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);
             end
 
             if (pop_read) begin
-                automatic logic [QIDX_BITS-1:0] p_slot = find_free_slot(read_pending);
+                automatic logic [QIDX_BITS-1:0] p_slot = QIDX_BITS'(find_free_slot(read_pending));
                 automatic logic [QIDX_BITS-1:0] q_idx = read_q_head;
                 read_pending[p_slot] <= read_req_q[q_idx];
-                //read_pending[p_slot].cnt <= '0;
                 read_pending[p_slot].active <= 1'b1;
-                read_q_head <= (read_q_head + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);;
+                read_q_head <= (read_q_head + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);
             end
 
             read_q_count <= read_q_count + (push_read ? 1 : 0) - (pop_read ? 1 : 0);
@@ -198,30 +184,24 @@ module axi4_master
 
             if (read_q_count > 0) begin
                 automatic logic [QIDX_BITS-1:0] idx = read_q_head;
-                //bus.ARVALID <= 1'b1;
                 bus.ARADDR  <= read_req_q[idx].addr;
                 bus.ARLEN   <= read_req_q[idx].len;
-                bus.ARSIZE  <= 3'($clog2(read_req_q[idx].size_bytes));
+                bus.ARSIZE  <= read_req_q[idx].size_code;                // FIX: используем код
                 bus.ARBURST <= read_req_q[idx].burst;
                 bus.ARID    <= read_req_q[idx].id;
-            end else begin
-                //bus.ARVALID <= 1'b0;
-            end
+            end 
             bus.ARLOCK  <= 1'b0;
             bus.ARCACHE <= 4'b0000;
             bus.ARPROT  <= 3'b000;
-
-            //bus.RREADY <= (mrstate == R_DATA);
 
             if (mrstate == R_DATA && bus.RVALID && bus.RREADY) begin
                 automatic int idx = find_read_by_id(bus.RID);
                 if (idx >= 0) begin
                     read_data_out <= bus.RDATA;
                     read_resp_out <= bus.RRESP;
-                    read_rid_out    <= bus.RID;
+                    read_rid_out  <= bus.RID;
 
                     if (!bus.RLAST) begin
-                        //read_pending[idx].cnt <= read_pending[idx].cnt + 1;
                         read_pending[idx].addr <= addr_next(
                             read_pending[idx].size_bytes,
                             read_pending[idx].len,
@@ -240,66 +220,71 @@ module axi4_master
         end
     end
 
-   // always_comb begin
-   //     has_active_writes = 1'b0;
-   //     for (int i = 0; i < MAX_OUTSTANDING; i++)
-   //         if (write_pending[i].active) has_active_writes = 1'b1;
-   // end
-
-   // assign can_issue_write = (write_q_count > 0) && (find_free_slot(write_pending) >= 0);
-    assign bus.WLAST = (mwstate == W_DATA && active_idx >= 0) &&
-                       (write_pending[active_idx].cnt == write_pending[active_idx].len);
     assign push_write = start_write &&
                         (write_q_count < MAX_OUTSTANDING) &&
                         (wdata_count < MAX_OUTSTANDING);
 
-    assign pop_write = (mwstate == W_ADDR) && bus.AWREADY &&
-                        (write_q_count > 0);
+    assign pop_aw = (write_q_count > 0) && (active_count < MAX_OUTSTANDING) && bus.AWREADY;
 
-    assign pop_wdata = (mwstate == W_DATA) && bus.WVALID && bus.WREADY;
+    logic w_active;
+    assign w_active = (w_ptr != aw_head) && write_req_q[w_ptr].active;
+
+    assign bus.WVALID = w_active && (write_req_q[w_ptr].cnt <= write_req_q[w_ptr].len);
+    assign bus.WLAST  = w_active && (write_req_q[w_ptr].cnt == write_req_q[w_ptr].len); 
+
+    assign bus.BREADY = (b_ptr != aw_head) && write_req_q[b_ptr].active;
+    assign pop_wdata = bus.WVALID && bus.WREADY;
+    assign pop_b = bus.BVALID && bus.BREADY;
+
+    assign bus.AWVALID = (write_q_count > 0) && (active_count < MAX_OUTSTANDING);
 
     always_comb begin
-        active_idx = -1;
-        for (int i = 0; i < MAX_OUTSTANDING; i++) begin
-            if (write_pending[i].active) begin
-                active_idx = i;
-                break;
-            end
+        bus.AWADDR  = '0;
+        bus.AWLEN   = '0;
+        bus.AWSIZE  = '0;
+        bus.AWBURST = INCR;
+        bus.AWID    = '0;
+        if (write_q_count > 0) begin
+            bus.AWADDR  = write_req_q[aw_head].addr;
+            bus.AWLEN   = write_req_q[aw_head].len;
+            bus.AWSIZE  = write_req_q[aw_head].size_code;               // FIX: используем код
+            bus.AWBURST = write_req_q[aw_head].burst;
+            bus.AWID    = write_req_q[aw_head].id;
+        end
+        bus.AWLOCK  = 1'b0;
+        bus.AWCACHE = 4'b0000;
+        bus.AWPROT  = 3'b000;
+    end
+
+    always_comb begin
+        bus.WDATA = '0;
+        bus.WSTRB = '0;
+        if (w_active) begin
+            bus.WDATA = wdata_fifo[w_ptr];
+            bus.WSTRB = gen_wstrb(
+                write_req_q[w_ptr].addr[OFFSET_BITS-1:0],
+                write_req_q[w_ptr].size_bytes
+            );
         end
     end
 
     always_ff @(posedge bus.ACLK or negedge bus.ARESETn) begin
         if (!bus.ARESETn) begin
-            mwstate <= W_IDLE;
-            write_q_head <= '0;
-            write_q_tail <= '0;
-            write_q_count <= '0;
-            wdata_head <= '0;
-            wdata_tail <= '0;
-            wdata_count <= '0;
+            write_q_tail <= 0;
+            write_q_count <= 0;
+            aw_head <= 0;
+            w_ptr <= 0;
+            b_ptr <= 0;
+            active_count <= 0;
+            wdata_count <= 0;
             for (int i = 0; i < MAX_OUTSTANDING; i++) begin
                 write_req_q[i] <= '0;
-                write_pending[i].active <= 1'b0;
                 wdata_fifo[i] <= '0;
             end
-            bus.AWVALID <= 1'b0;
-            bus.AWADDR <= '0;
-            bus.AWLEN <= '0;
-            bus.AWSIZE <= '0;
-            bus.AWBURST <= INCR;
-            bus.AWID <= '0;
-            bus.AWLOCK <= 1'b0;
-            bus.AWCACHE <= 4'b0000;
-            bus.AWPROT <= 3'b000;
-            bus.WVALID <= 1'b0;
-            bus.WDATA  <= '0;
-            bus.WSTRB  <= '0;
-            bus.BREADY <= 1'b0;
             write_done <= 1'b0;
             write_id_out <= '0;
             write_resp_out <= OKAY;
         end else begin
-            mwstate <= mwstate_next;
             write_done <= 1'b0;
 
             if (push_write) begin
@@ -307,81 +292,59 @@ module axi4_master
                 write_req_q[write_q_tail].addr       <= write_addr;
                 write_req_q[write_q_tail].len        <= write_len;
                 write_req_q[write_q_tail].size_bytes <= 1 << write_size;
+                write_req_q[write_q_tail].size_code  <= write_size;      // FIX: сохраняем код
                 write_req_q[write_q_tail].burst      <= write_burst;
-                write_req_q[write_q_tail].cnt        <= '0;
+                write_req_q[write_q_tail].cnt        <= 0;
                 write_req_q[write_q_tail].active     <= 1'b0;
-                wdata_fifo[wdata_tail]               <= write_data;
-                write_q_tail <= (write_q_tail + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);;
-                wdata_tail   <= (wdata_tail + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);;
+                wdata_fifo[write_q_tail]             <= write_data;
+                write_q_tail <= (write_q_tail + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);
             end
 
-            if (pop_write) begin
-                automatic logic [QIDX_BITS-1:0] p_slot = find_free_slot(write_pending);
-                automatic logic [QIDX_BITS-1:0] q_idx = write_q_head;
-                write_pending[p_slot] <= write_req_q[q_idx];
-                write_pending[p_slot].active <= 1'b1;
-                write_pending[p_slot].cnt <= '0; 
-                write_q_head <= (write_q_head + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);;
+            if (pop_aw) begin
+                write_req_q[aw_head].active <= 1'b1;
+                write_req_q[aw_head].cnt    <= 0;
+                aw_head <= (aw_head + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);
             end
 
             if (pop_wdata) begin
-                wdata_head <= (wdata_head + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);;
-            end
-
-            write_q_count <= write_q_count + (push_write ? 1 : 0) - (pop_write ? 1 : 0);
-            wdata_count   <= wdata_count   + (push_write ? 1 : 0) - (pop_wdata ? 1 : 0);
-
-            if (write_q_count > 0) begin
-                automatic logic [QIDX_BITS-1:0] idx = write_q_head;
-                bus.AWVALID <= 1'b1;
-                bus.AWADDR  <= write_req_q[idx].addr;
-                bus.AWLEN   <= write_req_q[idx].len;
-                bus.AWSIZE  <= 3'($clog2(write_req_q[idx].size_bytes));
-                bus.AWBURST <= write_req_q[idx].burst;
-                bus.AWID    <= write_req_q[idx].id;
-            end else begin
-                bus.AWVALID <= 1'b0;
-            end
-            bus.AWLOCK  <= 1'b0;
-            bus.AWCACHE <= 4'b0000;
-            bus.AWPROT  <= 3'b000;
-
-            bus.WVALID <= (mwstate == W_DATA && active_idx >= 0);
-            if (mwstate == W_DATA && active_idx >= 0) begin
-                bus.WDATA <= wdata_fifo[wdata_head];
-                bus.WSTRB <= gen_wstrb(
-                                 write_req_q[active_idx].addr[OFFSET_BITS-1:0],
-                                 write_req_q[active_idx].size_bytes
-                             );
-            end else begin
-                bus.WDATA <= '0;
-                bus.WSTRB <= '0;
-            end
-
-            if (mwstate == W_DATA && bus.WVALID && bus.WREADY) begin
-                if (!bus.WLAST) begin
-                    write_pending[active_idx].cnt <= write_pending[active_idx].cnt + 1;
-                    write_pending[active_idx].addr <= addr_next(
-                        write_pending[active_idx].size_bytes,
-                        write_pending[active_idx].len,
-                        write_pending[active_idx].burst,
-                        write_pending[active_idx].addr
-                    );
+                if (w_active) begin
+                    if (!bus.WLAST) begin
+                        write_req_q[w_ptr].cnt <= write_req_q[w_ptr].cnt + 1;
+                        write_req_q[w_ptr].addr <= addr_next(
+                            write_req_q[w_ptr].size_bytes,
+                            write_req_q[w_ptr].len,
+                            write_req_q[w_ptr].burst,
+                            write_req_q[w_ptr].addr
+                        );
+                    end else begin
+                        w_ptr <= (w_ptr + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);
+                    end
                 end
             end
 
-            bus.BREADY <= (mwstate == W_RESP);
+            write_q_count <= write_q_count
+                           + (push_write ? 1 : 0)
+                           - (pop_aw    ? 1 : 0);
 
-            if (mwstate == W_RESP && bus.BVALID && bus.BREADY) begin
-                automatic int wr_idx = find_write_by_id(bus.BID);
-                if (wr_idx >= 0) begin
-                    write_id_out    <= write_pending[wr_idx].id;
-                    write_resp_out  <= bus.BRESP;
-                    write_pending[wr_idx].active <= 1'b0;
-                    write_done      <= 1'b1;
+            active_count  <= active_count
+                           + (pop_aw    ? 1 : 0)
+                           - (pop_b     ? 1 : 0);
+
+            wdata_count   <= wdata_count
+                           + (push_write ? 1 : 0)
+                           - (pop_b     ? 1 : 0);
+
+            if (pop_b) begin
+                if (write_req_q[b_ptr].active) begin
+                    write_id_out   <= write_req_q[b_ptr].id;
+                    write_resp_out <= bus.BRESP;
+                    write_done     <= 1'b1;
+                    write_req_q[b_ptr].active <= 1'b0;
+                    b_ptr <= (b_ptr + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);
                 end else begin
-                    write_resp_out  <= DECERR;
-                    write_done      <= 1'b1;
+                    write_resp_out <= DECERR;
+                    write_done     <= 1'b1;
+                    b_ptr <= (b_ptr + 1) & QIDX_BITS'(MAX_OUTSTANDING - 1);
                 end
             end
         end
