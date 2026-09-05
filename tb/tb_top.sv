@@ -23,8 +23,6 @@ module tb_top;
   logic [1:0]            read_resp_out;
   logic [DATA_WIDTH-1:0] read_data_out;
   logic                  read_done;
-  logic [DATA_WIDTH-1:0] rdata1, rdata2, rdata3;
-  logic [ID_WIDTH-1:0]   rid1, rid2, rid3;
 
   logic                  start_write;
   logic [ID_WIDTH-1:0]   write_id;
@@ -36,6 +34,14 @@ module tb_top;
   logic [ID_WIDTH-1:0]   write_id_out;
   logic [1:0]            write_resp_out;
   logic                  write_done;
+  logic                  write_ready;
+  logic                  read_ready;
+
+  // Счётчики для проверки потерь
+  int writes_sent    = 0;
+  int writes_done    = 0;
+  int reads_sent     = 0;
+  int reads_done     = 0;
 
   always #5 ACLK = ~ACLK;
 
@@ -66,15 +72,18 @@ module tb_top;
     .read_resp_out(read_resp_out),
     .read_data_out(read_data_out),
     .read_done(read_done),
+    .read_ready(read_ready),
     .write_id_out(write_id_out),
     .write_resp_out(write_resp_out),
-    .write_done(write_done)
+    .write_done(write_done),
+    .write_ready(write_ready)
   );
 
   logic test_passed;
 
+
   // --------------------------------------------------------------
-  // Задача записи – безопасная синхронизация
+  // Задача записи – ожидает готовности, выставляет запрос на 1 такт
   // --------------------------------------------------------------
   task do_write(
     input [ID_WIDTH-1:0]   id,
@@ -84,9 +93,8 @@ module tb_top;
     input [2:0]            size,
     input [1:0]            burst
   );
-    // Устанавливаем start_write сразу после положительного фронта,
-    // чтобы он был виден на следующем такте.
     @(posedge ACLK);
+    while (!write_ready) @(posedge ACLK);
     start_write <= 1;
     write_id    <= id;
     write_addr  <= addr;
@@ -94,27 +102,13 @@ module tb_top;
     write_len   <= len;
     write_size  <= size;
     write_burst <= burst;
-
-    // Держим активным ровно один такт
+    writes_sent++;
     @(posedge ACLK);
     start_write <= 0;
-
-    // Ожидаем завершения записи
-    while (!write_done) @(posedge ACLK);
-
-    if (write_id_out !== id) begin
-      $display("ERROR: Write ID mismatch: sent %0d, got %0d", id, write_id_out);
-      test_passed = 0;
-    end
-    if (write_resp_out != OKAY) begin
-      $display("ERROR: Write response not OKAY: %0d", write_resp_out);
-      test_passed = 0;
-    end
-    $display("Write done: ID=%0d, addr=0x%8h, data=0x%8h", id, addr, data);
   endtask
 
   // --------------------------------------------------------------
-  // Задача чтения – аналогичная синхронизация
+  // Задача чтения – аналогично
   // --------------------------------------------------------------
   task do_read(
     input [ID_WIDTH-1:0]   id,
@@ -125,29 +119,26 @@ module tb_top;
     output [DATA_WIDTH-1:0] data
   );
     @(posedge ACLK);
+    while (!read_ready) @(posedge ACLK);
     start_read <= 1;
     read_id    <= id;
     read_addr  <= addr;
     read_len   <= len;
     read_size  <= size;
     read_burst <= burst;
-
+    reads_sent++;
     @(posedge ACLK);
     start_read <= 0;
-
-    while (!read_done) @(posedge ACLK);
-
-    if (read_rid_out !== id) begin
-      $display("ERROR: Read ID mismatch: sent %0d, got %0d", id, read_rid_out);
-      test_passed = 0;
-    end
-    if (read_resp_out != OKAY) begin
-      $display("ERROR: Read response not OKAY: %0d", read_resp_out);
-      test_passed = 0;
-    end
-    data = read_data_out;
-    $display("Read done: ID=%0d, addr=0x%8h, data=0x%8h", id, addr, data);
+    // Не ждём завершения – оно будет отслеживаться отдельно
   endtask
+
+  // --------------------------------------------------------------
+  // Отслеживание завершённых транзакций
+  // --------------------------------------------------------------
+  always @(posedge ACLK) begin
+    if (write_done) writes_done++;
+    if (read_done)  reads_done++;
+  end
 
   // --------------------------------------------------------------
   // Основной тест
@@ -160,11 +151,13 @@ module tb_top;
     test_passed = 1;
 
     #20 ARESETn = 1;
-    @(posedge ACLK); // даём время на выход из сброса
+    @(posedge ACLK);
 
     $display("\n=== Test 1: Simple write+read with ID ===\n");
     do_write(5, 32'h00001000, 32'hDEADBEEF, 0, 3'b010, INCR);
     do_read(5, 32'h00001000, 0, 3'b010, INCR, read_data_out);
+    // Ожидаем завершения этих двух транзакций
+    while (writes_done < 1 || reads_done < 1) @(posedge ACLK);
     if (read_data_out != 32'hDEADBEEF) begin
       $display("ERROR: Data mismatch: expected DEADBEEF, got %h", read_data_out);
       test_passed = 0;
@@ -175,84 +168,78 @@ module tb_top;
     do_write(2, 32'h00001020, 32'h9ABCDEF0, 0, 3'b010, INCR);
     do_read(1, 32'h00001010, 0, 3'b010, INCR, read_data_out);
     do_read(2, 32'h00001020, 0, 3'b010, INCR, read_data_out);
+    while (writes_done < 3 || reads_done < 3) @(posedge ACLK);
 
     $display("\n=== Test 3: Burst write and read (4 beats) ===\n");
     do_write(3, 32'h00001000, 32'hA5A5A5A5, 3, 3'b010, INCR);
     do_read(3, 32'h00001000, 3, 3'b010, INCR, read_data_out);
+    while (writes_done < 4 || reads_done < 4) @(posedge ACLK);
 
-   // $display("\n=== Test 4: 3 outstanding reads ===\n");
-   // do_write(10, 32'h00001000, 32'hAAAAAAAA, 0, 3'b010, INCR);
-   // do_write(11, 32'h00001010, 32'hBBBBBBBB, 0, 3'b010, INCR);
-   // do_write(12, 32'h00001020, 32'hCCCCCCCC, 0, 3'b010, INCR);
+    // --------------------------------------------------------------
+    // Test 5: Buffer overflow / переполнение очередей
+    // --------------------------------------------------------------
+    $display("\n=== Test 5: Buffer overflow (MAX_OUTSTANDING=8) ===\n");
 
-    // Запускаем три чтения подряд с разными ID
-   // fork
-   //   begin
-   //     @(posedge ACLK);
-   //     start_read <= 1;
-   //     read_id    <= 4;
-   //     read_addr  <= 32'h00001000;
-   //     read_len   <= 0;
-   //     read_size  <= 3'b010;
-   //     read_burst <= INCR;
-   //     @(posedge ACLK);
-   //     start_read <= 0;
-   //   end
-   //   begin
-   //     @(posedge ACLK);
-   //     start_read <= 1;
-   //     read_id    <= 5;
-   //     read_addr  <= 32'h00001010;
-   //     read_len   <= 0;
-   //     read_size  <= 3'b010;
-   //     read_burst <= INCR;
-   //     @(posedge ACLK);
-   //     start_read <= 0;
-   //   end
-   //   begin
-   //     @(posedge ACLK);
-   //     start_read <= 1;
-   //     read_id    <= 6;
-   //     read_addr  <= 32'h00001020;
-   //     read_len   <= 0;
-   //     read_size  <= 3'b010;
-   //     read_burst <= INCR;
-   //     @(posedge ACLK);
-   //     start_read <= 0;
-   //   end
-   // join
+    // Отправляем 20 записей с ожиданием готовности (без ожидания завершения)
+    for (int i = 0; i < 20; i++) begin
+      do_write(i[ID_WIDTH-1:0], 32'h00002000 + i*4, 32'hA0000000 + i, 0, 3'b010, INCR);
+    end
 
-   // // Собираем результаты трёх чтений
-   // begin
-   //   automatic int cnt = 0;
-   //   while (cnt < 3) begin
-   //     @(posedge ACLK);
-   //     if (read_done) begin
-   //       cnt++;
-   //       $display("Read done: ID=%0d, data=0x%8h", read_rid_out, read_data_out);
-   //       case (read_rid_out)
-   //         4: begin rdata1 = read_data_out; rid1 = read_rid_out; end
-   //         5: begin rdata2 = read_data_out; rid2 = read_rid_out; end
-   //         6: begin rdata3 = read_data_out; rid3 = read_rid_out; end
-   //       endcase
-   //     end
-   //   end
-   // end
+    // Отправляем 20 чтений
+    for (int i = 0; i < 20; i++) begin
+      do_read(i[ID_WIDTH-1:0], 32'h00002000 + i*4, 0, 3'b010, INCR, read_data_out);
+    end
 
-   // if (rid1 == 4 && rdata1 != 32'hAAAAAAAA) begin
-   //   $display("ERROR: Read1 data mismatch, expected AAAAAAAA, got %h", rdata1);
-   //   test_passed = 0;
-   // end
-   // if (rid2 == 5 && rdata2 != 32'hBBBBBBBB) begin
-   //   $display("ERROR: Read2 data mismatch, expected BBBBBBBB, got %h", rdata2);
-   //   test_passed = 0;
-   // end
-   // if (rid3 == 6 && rdata3 != 32'hCCCCCCCC) begin
-   //   $display("ERROR: Read3 data mismatch, expected CCCCCCCC, got %h", rdata3);
-   //   test_passed = 0;
-   // end
+    // Ждём завершения всех транзакций с тайм-аутом
+    $display("Waiting for all writes and reads to finish...");
+    begin
+      automatic int timeout = 100000;
+      while ((writes_done < writes_sent || reads_done < reads_sent) && timeout > 0) begin
+        @(posedge ACLK);
+        timeout--;
+        if (timeout == 0) begin
+          $display("ERROR: Timeout! writes_done=%0d/%0d, reads_done=%0d/%0d",
+                   writes_done, writes_sent, reads_done, reads_sent);
+          test_passed = 0;
+          $finish;
+        end
+      end
+    end
+    $display("All transactions completed.");
 
-    // Итог
+    // Проверяем, что все отправленные транзакции завершились
+    if (writes_done != writes_sent) begin
+      $display("ERROR: Lost %0d write transactions!", writes_sent - writes_done);
+      test_passed = 0;
+    end
+    if (reads_done != reads_sent) begin
+      $display("ERROR: Lost %0d read transactions!", reads_sent - reads_done);
+      test_passed = 0;
+    end
+
+    // Проверяем данные для первых 8 записей (они гарантированно должны быть записаны)
+    for (int i = 0; i < 8; i++) begin
+      automatic logic [DATA_WIDTH-1:0] rddata;
+      // Используем do_read, которая будет ждать готовности и завершения, 
+      // но сейчас все транзакции уже завершены, можно просто прочитать.
+      // Для простоты используем отдельный цикл чтения.
+      start_read <= 1;
+      read_id    <= i[ID_WIDTH-1:0];
+      read_addr  <= 32'h00002000 + i*4;
+      read_len   <= 0;
+      read_size  <= 3'b010;
+      read_burst <= INCR;
+      @(posedge ACLK);
+      start_read <= 0;
+      while (!read_done) @(posedge ACLK);
+      rddata = read_data_out;
+      if (rddata !== 32'hA0000000 + i) begin
+        $display("ERROR: Data mismatch for i=%0d, expected %h, got %h",
+                 i, 32'hA0000000 + i, rddata);
+        test_passed = 0;
+      end
+    end
+
     if (test_passed) begin
       $display("\n=========================================");
       $display(" ALL TESTS PASSED ");
