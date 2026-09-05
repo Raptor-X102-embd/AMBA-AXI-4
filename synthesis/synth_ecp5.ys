@@ -1,0 +1,30 @@
+# ============================================
+#  Yosys synthesis script for AXI4 modules
+#  Target: ECP5 (LFE5U-25F)
+# ============================================
+
+# 1. Read all SystemVerilog sources with include paths
+read_verilog -sv -I headers -I ../common? \
+    src/axi4_master.sv \
+    src/axi4_slave.sv  \
+    src/top_module.sv
+
+# (Если top_module.sv использует другие файлы – добавьте их)
+
+# 2. Set top module (замените на имя вашего топ-модуля)
+hierarchy -top top_module
+
+# 3. Convert behavioural processes to RTL
+proc
+
+# 4. Perform basic optimisations
+opt
+
+# 5. Technology mapping for ECP5 (используйте synth_ecp5)
+synth_ecp5 -top top_module -json build/top.json -abc9 -dff
+
+# 6. (Опционально) Сохранить синтезированную нетлист для просмотра
+write_verilog -noattr build/synth_netlist.v
+
+# 7. Вывести статистику использования ресурсов
+stat
