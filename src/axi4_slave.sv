@@ -10,7 +10,8 @@ module axi4_slave
     parameter MEM_SIZE = 1024,
     parameter ADDR_WIDTH = 32,
     parameter DATA_WIDTH = 32,
-    parameter ID_WIDTH   = 4
+    parameter ID_WIDTH   = 4,
+    parameter MIN_ADDR   = 32'h00000000
 ) (
     axi4_if.slave bus
 );
@@ -23,7 +24,7 @@ module axi4_slave
     // Mem - array of words, not bytes
     // it is done to avoid multiple simultanious writes at different addresses
     localparam WORDS = MEM_SIZE / DATA_WIDTH_BYTES;
-    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] mem [0:WORDS-1];
+    (* ram_style = "block" *) logic [DATA_WIDTH-1:0] mem [MIN_ADDR:MIN_ADDR+WORDS-1];
 
     logic [ADDR_WIDTH-1:0] raddr;
     logic [7:0] rburst_size;
@@ -62,7 +63,7 @@ module axi4_slave
         case (srstate)
             READ_IDLE:       srstate_next = (bus.ARVALID && bus.ARREADY) ? READ_DATA : READ_IDLE;
             READ_DATA:       srstate_next = READ_SEND_RDATA; // shift 1 cycle to get rdata from mem
-            READ_SEND_RDATA: srstate_next = (bus.RVALID && bus.RREADY && bus.RLAST) ?
+            READ_SEND_RDATA: srstate_next = (bus.RREADY && (rburst_cnt == rburst_len)) ?
                                             READ_IDLE : READ_SEND_RDATA;
             default:         srstate_next = READ_IDLE;
         endcase
@@ -76,9 +77,9 @@ module axi4_slave
         endcase
     end
 
-    assign roffset = raddr[OFFSET_BITS-1:0];
+    //assign roffset = raddr[OFFSET_BITS-1:0];
     assign woffset = waddr[OFFSET_BITS-1:0];
-    assign bus.RLAST = (srstate == READ_SEND_RDATA) && (rburst_cnt == rburst_len);
+    //assign bus.RLAST = (srstate == READ_SEND_RDATA) && (rburst_cnt == rburst_len);
     assign bus.ARREADY = (srstate == READ_IDLE) ||
                          (srstate == READ_SEND_RDATA && bus.RLAST && bus.RREADY);
 
@@ -96,6 +97,7 @@ module axi4_slave
         end else begin
             srstate <= srstate_next;
             bus.RVALID <= (srstate == READ_SEND_RDATA);
+            bus.RLAST  <= (srstate == READ_SEND_RDATA) && (rburst_cnt == rburst_len);
 
             if (bus.ARVALID && bus.ARREADY) begin
                 raddr        <= bus.ARADDR;
@@ -108,12 +110,14 @@ module axi4_slave
 
             if (srstate == READ_DATA || srstate == READ_SEND_RDATA) begin
                 rdata_reg <= mem[raddr >> OFFSET_BITS];
+                roffset <= raddr[OFFSET_BITS-1:0] * 8;
 
-                bus.RDATA <= rdata_reg >> (roffset * 8);
+                bus.RDATA <= rdata_reg >> roffset;
+                // TODO: RVALID check RRESP
                 bus.RRESP <= (rburst_size <= DATA_WIDTH_BYTES) ? OKAY : SLVERR;
                 bus.RID   <= rid_reg;
 
-                if (bus.RVALID && bus.RREADY) begin
+                if (bus.RREADY && (srstate == READ_SEND_RDATA)) begin
                     if (rburst_cnt != rburst_len) begin
                         rburst_cnt <= rburst_cnt + 1;
                         raddr <= addr_next(rburst_size, rburst_len, rburst_type, raddr);

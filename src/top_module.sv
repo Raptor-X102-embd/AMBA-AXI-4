@@ -28,9 +28,11 @@ module top_module #(
     output logic [1:0]            read_resp_out,
     output logic [DATA_WIDTH-1:0] read_data_out,
     output logic                  read_done,
+    output logic                  read_ready,
     output logic [ID_WIDTH-1:0]   write_id_out,
     output logic [1:0]            write_resp_out,
-    output logic                  write_done
+    output logic                  write_done,
+    output logic                  write_ready
 );
 
   axi4_if #(
@@ -67,9 +69,11 @@ module top_module #(
     .read_resp_out(read_resp_out),
     .read_data_out(read_data_out),
     .read_done(read_done),
+    .read_ready(read_ready),
     .write_id_out(write_id_out),
     .write_resp_out(write_resp_out),
-    .write_done(write_done)
+    .write_done(write_done),
+    .write_ready(write_ready)
   );
 
   axi4_slave #(
